@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import logging
+import time
 from typing import Any, Dict, Optional, Tuple
 
 import aiohttp
@@ -16,6 +17,7 @@ class DayZMonitor(commands.Cog):
     """Monitor DayZ SA Launcher population and alert when servers become full."""
 
     API_BASE = "https://dayzsalauncher.com/api/v2/launcher/players"
+    NON_FULL_RESET_SECONDS = 10 * 60
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -151,6 +153,7 @@ class DayZMonitor(commands.Cog):
             return
 
         changed = False
+        now = int(time.time())
         for name, server in data.items():
             address = server.get("address")
             channel_id = server.get("channel_id")
@@ -175,16 +178,42 @@ class DayZMonitor(commands.Cog):
                 continue
 
             last_full = bool(server.get("last_full", False))
-            if is_full and not last_full:
-                channel = guild.get_channel(channel_id)
-                if channel:
-                    await channel.send(
-                        f":rotating_light: **{name}** is now full.\n"
-                        f"Online: `{parsed['online']}/{parsed['max_players']}` | "
-                        f"Queue: `{parsed['queue']}`"
-                    )
-            server["last_full"] = is_full
-            changed = True
+            not_full_since = server.get("not_full_since")
+
+            if is_full:
+                if not last_full:
+                    channel = guild.get_channel(channel_id)
+                    if channel:
+                        await channel.send(
+                            f":rotating_light: **{name}** is now full.\n"
+                            f"Online: `{parsed['online']}/{parsed['max_players']}` | "
+                            f"Queue: `{parsed['queue']}`"
+                        )
+                    server["last_full"] = True
+                    changed = True
+                if not_full_since is not None:
+                    server["not_full_since"] = None
+                    changed = True
+            else:
+                if last_full:
+                    if not_full_since is None:
+                        server["not_full_since"] = now
+                        changed = True
+                    else:
+                        try:
+                            non_full_duration = now - int(not_full_since)
+                        except (TypeError, ValueError):
+                            non_full_duration = 0
+                            server["not_full_since"] = now
+                            changed = True
+
+                        if non_full_duration >= self.NON_FULL_RESET_SECONDS:
+                            server["last_full"] = False
+                            server["not_full_since"] = None
+                            changed = True
+                elif not_full_since is not None:
+                    server["not_full_since"] = None
+                    changed = True
 
         if changed:
             await self.config.guild(guild).servers.set(data)
@@ -229,6 +258,7 @@ class DayZMonitor(commands.Cog):
             "address": address,
             "channel_id": channel.id,
             "last_full": bool(parsed.get("is_full", False)),
+            "not_full_since": None,
         }
         await self.config.guild(ctx.guild).servers.set(servers)
         await ctx.send(

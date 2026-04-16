@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import logging
 from typing import Any, Dict, Optional, Tuple
 
 import aiohttp
@@ -7,6 +8,8 @@ import discord
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 from redbot.core.utils.chat_formatting import box
+
+log = logging.getLogger("red.dayz_monitor")
 
 
 class DayZMonitor(commands.Cog):
@@ -19,7 +22,13 @@ class DayZMonitor(commands.Cog):
         self.config = Config.get_conf(self, identifier=9013470171, force_registration=True)
         self.config.register_guild(servers={}, check_interval=60)
         self.session: Optional[aiohttp.ClientSession] = None
-        self._task = self.bot.loop.create_task(self._monitor_loop())
+        self._task: Optional[asyncio.Task] = None
+        self._start_monitor()
+
+    def _start_monitor(self):
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._monitor_loop())
+            log.info("DayZ monitor task started.")
 
     def cog_unload(self):
         if self._task:
@@ -32,6 +41,7 @@ class DayZMonitor(commands.Cog):
                 await self._task
         if self.session and not self.session.closed:
             await self.session.close()
+            log.info("DayZ monitor HTTP session closed.")
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
@@ -129,8 +139,10 @@ class DayZMonitor(commands.Cog):
                     intervals.append(max(30, int(i)))
                 await asyncio.sleep(min(intervals) if intervals else 60)
             except asyncio.CancelledError:
+                log.info("DayZ monitor task cancelled.")
                 raise
             except Exception:
+                log.exception("Unhandled exception in DayZ monitor loop; retrying in 30s.")
                 await asyncio.sleep(30)
 
     async def _check_guild(self, guild: discord.Guild):
@@ -149,6 +161,13 @@ class DayZMonitor(commands.Cog):
                 payload = await self._fetch_server_data(address)
                 parsed = self._parse_population(payload)
             except Exception:
+                log.exception(
+                    "Failed to query DayZ server '%s' (%s) for guild %s (%s).",
+                    name,
+                    address,
+                    guild.name,
+                    guild.id,
+                )
                 continue
 
             is_full = parsed["is_full"]

@@ -1,0 +1,20 @@
+{
+  "author": [
+    "basn",
+    "codex"
+  ],
+  "description": "Monitor DayZ SA Launcher server population, free slots, and queue. Alerts a channel when a server becomes full.",
+  "install_msg": "Thanks for installing DayZMonitor. Use `[p]dayz add <name> <ip:port>` to start tracking servers.",
+  "short": "DayZ server population monitor",
+  "name": "DayZMonitor",
+  "requirements": [],
+  "tags": [
+    "dayz",
+    "monitoring",
+    "alerts"
+  ],
+  "min_bot_version": "3.5.0",
+  "hidden": false,
+  "disabled": false,
+  "type": "COG"
+}

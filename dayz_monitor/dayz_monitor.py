@@ -61,16 +61,25 @@ class DayZMonitor(commands.Cog):
         return None
 
     def _parse_population(self, payload: Dict[str, Any]) -> Dict[str, Optional[int]]:
-        # API field names vary; this supports common variants.
+        # API field names vary; this supports common variants, including:
+        # {"status":0,"result":{"players":57,"maxPlayers":100}}
+        source = payload
+        result = payload.get("result")
+        if isinstance(result, dict):
+            source = result
+
         online = self._pick_int(
-            payload,
+            source,
             ("players", "numplayers", "online", "playerCount", "Players", "NumPlayers"),
         )
         max_players = self._pick_int(
-            payload,
+            source,
             ("maxplayers", "maxPlayers", "slots", "MaxPlayers", "max"),
         )
-        queue = self._pick_int(payload, ("queue", "queuePlayers", "Queue", "waiting", "waitingPlayers"))
+        queue = self._pick_int(
+            source,
+            ("queue", "queuePlayers", "Queue", "waiting", "waitingPlayers"),
+        )
 
         free_slots = None
         is_full = None

@@ -281,16 +281,43 @@ class DayZMonitor(commands.Cog):
 
     @dayz_group.command(name="channel")
     @commands.admin_or_permissions(manage_guild=True)
-    async def dayz_channel(self, ctx: commands.Context, name: str, channel: discord.TextChannel):
-        """Set the alert channel for a monitored server."""
+    async def dayz_channel(
+        self,
+        ctx: commands.Context,
+        name: str,
+        channel: Optional[str] = None,
+    ):
+        """Set or clear the alert channel for a monitored server.
+
+        Examples:
+        - [p]dayz channel main #alerts
+        - [p]dayz channel main remove
+        """
         key = name.lower()
         servers = await self.config.guild(ctx.guild).servers()
         if key not in servers:
             await ctx.send(f"No monitored server named `{key}`.")
             return
-        servers[key]["channel_id"] = channel.id
+
+        if channel is None or channel.lower() in {"remove", "clear", "off", "none", "disable", "disabled"}:
+            servers[key]["channel_id"] = None
+            await self.config.guild(ctx.guild).servers.set(servers)
+            await ctx.send(
+                f"Alert channel for `{servers[key].get('name', key)}` cleared. Full alerts are now disabled."
+            )
+            return
+
+        try:
+            resolved_channel = await commands.TextChannelConverter().convert(ctx, channel)
+        except commands.BadArgument:
+            await ctx.send(
+                "Invalid channel. Mention a text channel (or provide channel ID/name), or use `remove` to clear."
+            )
+            return
+
+        servers[key]["channel_id"] = resolved_channel.id
         await self.config.guild(ctx.guild).servers.set(servers)
-        await ctx.send(f"Alert channel for `{servers[key].get('name', key)}` set to {channel.mention}.")
+        await ctx.send(f"Alert channel for `{servers[key].get('name', key)}` set to {resolved_channel.mention}.")
 
     @dayz_group.command(name="interval")
     @commands.admin_or_permissions(manage_guild=True)
@@ -310,8 +337,12 @@ class DayZMonitor(commands.Cog):
 
         lines = []
         for key, server in servers.items():
-            channel = ctx.guild.get_channel(server.get("channel_id", 0))
-            channel_text = channel.mention if channel else f"(missing channel `{server.get('channel_id')}`)"
+            channel_id = server.get("channel_id")
+            if not channel_id:
+                channel_text = "disabled"
+            else:
+                channel = ctx.guild.get_channel(channel_id)
+                channel_text = channel.mention if channel else f"(missing channel `{channel_id}`)"
             lines.append(f"- `{server.get('name', key)}` -> `{server.get('address')}` | alerts: {channel_text}")
         await ctx.send(box("\n".join(lines), lang="md"))
 

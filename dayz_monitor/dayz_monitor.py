@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import logging
 import time
+from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
 import aiohttp
@@ -18,6 +19,7 @@ class DayZMonitor(commands.Cog):
 
     API_BASE = "https://dayzsalauncher.com/api/v2/launcher/players"
     NON_FULL_RESET_SECONDS = 10 * 60
+    RESTART_WATCH_MAX_SECONDS = 30 * 60
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -25,22 +27,32 @@ class DayZMonitor(commands.Cog):
         self.config.register_guild(servers={}, check_interval=60)
         self.session: Optional[aiohttp.ClientSession] = None
         self._task: Optional[asyncio.Task] = None
+        self._restart_task: Optional[asyncio.Task] = None
+        self._restart_runtime: Dict[Tuple[int, str], Dict[str, Any]] = {}
         self._start_monitor()
 
     def _start_monitor(self):
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._monitor_loop())
             log.info("DayZ monitor task started.")
+        if self._restart_task is None or self._restart_task.done():
+            self._restart_task = asyncio.create_task(self._restart_watch_loop())
+            log.info("DayZ restart watcher task started.")
 
     def cog_unload(self):
         if self._task:
             self._task.cancel()
+        if self._restart_task:
+            self._restart_task.cancel()
         self.bot.loop.create_task(self._cleanup())
 
     async def _cleanup(self):
         if self._task:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
+        if self._restart_task:
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._restart_task
         if self.session and not self.session.closed:
             await self.session.close()
             log.info("DayZ monitor HTTP session closed.")
@@ -127,6 +139,52 @@ class DayZMonitor(commands.Cog):
             f"Queue: `{queue}`"
         )
 
+    @staticmethod
+    def _has_human_in_voice(guild: discord.Guild) -> bool:
+        channels = list(guild.voice_channels) + list(getattr(guild, "stage_channels", []))
+        for channel in channels:
+            for member in channel.members:
+                if not member.bot:
+                    return True
+        return False
+
+    @staticmethod
+    def _parse_restart_hours_input(raw: str) -> Optional[list]:
+        parts = [p.strip() for p in raw.replace(" ", ",").split(",") if p.strip()]
+        if not parts:
+            return None
+
+        hours = []
+        for p in parts:
+            if not p.isdigit():
+                return None
+            h = int(p)
+            if h < 0 or h > 23:
+                return None
+            hours.append(h)
+
+        return sorted(set(hours))
+
+    @staticmethod
+    def _format_restart_hours(hours: list) -> str:
+        if not hours:
+            return "disabled"
+        return ", ".join(f"{h:02d}:00" for h in hours)
+
+    @staticmethod
+    def _normalize_restart_hours(raw: Any) -> list:
+        if not isinstance(raw, list):
+            return []
+        out = []
+        for item in raw:
+            try:
+                hour = int(item)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= hour <= 23:
+                out.append(hour)
+        return sorted(set(out))
+
     async def _monitor_loop(self):
         await self.bot.wait_until_red_ready()
         while True:
@@ -146,6 +204,98 @@ class DayZMonitor(commands.Cog):
             except Exception:
                 log.exception("Unhandled exception in DayZ monitor loop; retrying in 30s.")
                 await asyncio.sleep(30)
+
+    async def _restart_watch_loop(self):
+        await self.bot.wait_until_red_ready()
+        while True:
+            try:
+                for guild in self.bot.guilds:
+                    await self._check_guild_restart_watch(guild)
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                log.info("DayZ restart watcher task cancelled.")
+                raise
+            except Exception:
+                log.exception("Unhandled exception in DayZ restart watcher loop; retrying in 5s.")
+                await asyncio.sleep(5)
+
+    async def _check_guild_restart_watch(self, guild: discord.Guild):
+        data = await self.config.guild(guild).servers()
+        if not data:
+            return
+
+        now_dt = datetime.now()
+        now_ts = int(time.time())
+        slot_key = now_dt.strftime("%Y%m%d%H")
+        has_voice = self._has_human_in_voice(guild)
+
+        for name, server in data.items():
+            address = server.get("address")
+            channel_id = server.get("channel_id")
+            restart_hours = self._normalize_restart_hours(server.get("restart_hours"))
+            if not address or not channel_id or not restart_hours:
+                self._restart_runtime.pop((guild.id, name), None)
+                continue
+
+            runtime = self._restart_runtime.setdefault(
+                (guild.id, name),
+                {"waiting": False, "slot_key": None, "saw_down": False, "down_since": None, "started_at": None},
+            )
+
+            if now_dt.minute == 0 and now_dt.hour in restart_hours and runtime.get("slot_key") != slot_key:
+                runtime["slot_key"] = slot_key
+                if has_voice:
+                    runtime["waiting"] = True
+                    runtime["saw_down"] = False
+                    runtime["down_since"] = None
+                    runtime["started_at"] = now_ts
+
+            if not runtime.get("waiting"):
+                continue
+
+            started_at = runtime.get("started_at") or now_ts
+            if now_ts - int(started_at) > self.RESTART_WATCH_MAX_SECONDS:
+                runtime["waiting"] = False
+                runtime["saw_down"] = False
+                runtime["down_since"] = None
+                continue
+
+            if not has_voice:
+                continue
+
+            is_up = False
+            parsed: Dict[str, Optional[int]] = {"online": None, "max_players": None, "queue": 0}
+            try:
+                payload = await self._fetch_server_data(address)
+                parsed = self._parse_population(payload)
+                is_up = parsed["online"] is not None and parsed["max_players"] is not None
+            except Exception:
+                is_up = False
+
+            if not is_up:
+                if not runtime.get("saw_down"):
+                    runtime["saw_down"] = True
+                    runtime["down_since"] = now_ts
+                continue
+
+            if not runtime.get("saw_down"):
+                # Avoid false positives when restart is delayed and server never dropped.
+                continue
+
+            channel = guild.get_channel(channel_id)
+            if channel:
+                down_since = runtime.get("down_since") or now_ts
+                downtime = max(now_ts - int(down_since), 0)
+                await channel.send(
+                    f":white_check_mark: **{name}** appears back online after restart.\n"
+                    f"Online: `{parsed['online']}/{parsed['max_players']}` | "
+                    f"Queue: `{parsed['queue']}` | "
+                    f"Downtime: `{downtime}s`"
+                )
+
+            runtime["waiting"] = False
+            runtime["saw_down"] = False
+            runtime["down_since"] = None
 
     async def _check_guild(self, guild: discord.Guild):
         data = await self.config.guild(guild).servers()
@@ -259,6 +409,7 @@ class DayZMonitor(commands.Cog):
             "channel_id": channel.id,
             "last_full": bool(parsed.get("is_full", False)),
             "not_full_since": None,
+            "restart_hours": [],
         }
         await self.config.guild(ctx.guild).servers.set(servers)
         await ctx.send(
@@ -277,6 +428,7 @@ class DayZMonitor(commands.Cog):
             return
         removed = servers.pop(key)
         await self.config.guild(ctx.guild).servers.set(servers)
+        self._restart_runtime.pop((ctx.guild.id, key), None)
         await ctx.send(f"Removed `{removed.get('name', key)}`.")
 
     @dayz_group.command(name="channel")
@@ -327,6 +479,41 @@ class DayZMonitor(commands.Cog):
         await self.config.guild(ctx.guild).check_interval.set(seconds)
         await ctx.send(f"Check interval set to `{seconds}` seconds.")
 
+    @dayz_group.command(name="restart")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def dayz_restart(self, ctx: commands.Context, name: str, *, hours: str):
+        """Set or clear hourly restart watch times for a monitored server.
+
+        Times use the bot host's local timezone and should be hour values 0-23.
+        Example: [p]dayz restart main 1,4,7,10,13,16,19,22
+        Clear:   [p]dayz restart main off
+        """
+        key = name.lower()
+        servers = await self.config.guild(ctx.guild).servers()
+        if key not in servers:
+            await ctx.send(f"No monitored server named `{key}`.")
+            return
+
+        if hours.lower() in {"remove", "clear", "off", "none", "disable", "disabled"}:
+            servers[key]["restart_hours"] = []
+            await self.config.guild(ctx.guild).servers.set(servers)
+            self._restart_runtime.pop((ctx.guild.id, key), None)
+            await ctx.send(f"Restart watch for `{servers[key].get('name', key)}` disabled.")
+            return
+
+        parsed_hours = self._parse_restart_hours_input(hours)
+        if parsed_hours is None:
+            await ctx.send("Invalid hours. Use comma/space separated values between `0` and `23` (e.g. `1,4,7,10`).")
+            return
+
+        servers[key]["restart_hours"] = parsed_hours
+        await self.config.guild(ctx.guild).servers.set(servers)
+        self._restart_runtime.pop((ctx.guild.id, key), None)
+        await ctx.send(
+            f"Restart watch for `{servers[key].get('name', key)}` set to: `{self._format_restart_hours(parsed_hours)}`.\n"
+            "When at least one non-bot user is in voice, the cog checks every second after those hours until the server returns."
+        )
+
     @dayz_group.command(name="list")
     async def dayz_list(self, ctx: commands.Context):
         """List monitored servers."""
@@ -343,7 +530,12 @@ class DayZMonitor(commands.Cog):
             else:
                 channel = ctx.guild.get_channel(channel_id)
                 channel_text = channel.mention if channel else f"(missing channel `{channel_id}`)"
-            lines.append(f"- `{server.get('name', key)}` -> `{server.get('address')}` | alerts: {channel_text}")
+            restart_hours = self._normalize_restart_hours(server.get("restart_hours"))
+            restart_text = self._format_restart_hours(restart_hours)
+            lines.append(
+                f"- `{server.get('name', key)}` -> `{server.get('address')}` | "
+                f"alerts: {channel_text} | restarts: {restart_text}"
+            )
         await ctx.send(box("\n".join(lines), lang="md"))
 
     @dayz_group.command(name="status", aliases=["query", "online"])

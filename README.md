@@ -19,6 +19,7 @@ Minimal Redbot cog repo for monitoring DayZ SA Launcher server population and qu
 
 - Add a server:
   - `[p]dayz add main 91.134.31.223:27017 #alerts`
+  - Use the server query port. For many DayZ servers this is not the game port.
 - Check one server:
   - `[p]dayz status main`
 - Check all:
@@ -34,3 +35,9 @@ Minimal Redbot cog repo for monitoring DayZ SA Launcher server population and qu
   - `[p]dayz channel <name> <#channel>`
 - Set check interval (seconds, min 30):
   - `[p]dayz interval <seconds>`
+
+## Queue Status
+
+The DayZ SA Launcher player endpoint only returns online and max player counts for
+some servers. This cog also queries the server directly with Steam A2S_INFO and
+reads DayZ's `lqsN` keyword when present, where `N` is the live queue size.

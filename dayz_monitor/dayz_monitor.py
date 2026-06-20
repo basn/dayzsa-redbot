@@ -1,6 +1,8 @@
 import asyncio
 import contextlib
 import logging
+import re
+import socket
 import time
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
@@ -18,6 +20,7 @@ class DayZMonitor(commands.Cog):
     """Monitor DayZ SA Launcher population and alert when servers become full."""
 
     API_BASE = "https://dayzsalauncher.com/api/v2/launcher/players"
+    A2S_INFO_QUERY = b"\xff\xff\xff\xffTSource Engine Query\x00"
     NON_FULL_RESET_SECONDS = 10 * 60
     RESTART_WATCH_MAX_SECONDS = 30 * 60
 
@@ -75,6 +78,107 @@ class DayZMonitor(commands.Cog):
             return data
 
     @staticmethod
+    def _parse_address(address: str) -> Tuple[str, int]:
+        host, sep, raw_port = address.rpartition(":")
+        if not sep or not host or not raw_port:
+            raise ValueError("Expected address in `host:query_port` format.")
+        try:
+            port = int(raw_port)
+        except ValueError as exc:
+            raise ValueError("Expected numeric query port in address.") from exc
+        if not 1 <= port <= 65535:
+            raise ValueError("Query port must be between 1 and 65535.")
+        return host.strip("[]"), port
+
+    async def _a2s_request(self, host: str, port: int, payload: bytes, timeout: float = 5.0) -> bytes:
+        loop = asyncio.get_running_loop()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setblocking(False)
+        try:
+            await loop.sock_sendto(sock, payload, (host, port))
+            data, _ = await asyncio.wait_for(loop.sock_recvfrom(sock, 65535), timeout=timeout)
+            return data
+        finally:
+            sock.close()
+
+    @staticmethod
+    def _read_cstring(data: bytes, pos: int) -> Tuple[str, int]:
+        end = data.find(b"\x00", pos)
+        if end == -1:
+            raise ValueError("Unterminated A2S string.")
+        return data[pos:end].decode("utf-8", "replace"), end + 1
+
+    @staticmethod
+    def _queue_from_keywords(keywords: str) -> Optional[int]:
+        for keyword in keywords.split(","):
+            match = re.fullmatch(r"lqs(\d+)", keyword.strip(), re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+        return None
+
+    @staticmethod
+    def _queue_from_bytes(data: bytes) -> Optional[int]:
+        try:
+            text = data.decode("utf-8", "ignore")
+        except Exception:
+            return None
+
+        match = re.search(r"\blqs(\d+)\b", text, flags=re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        return None
+
+    def _parse_a2s_info(self, data: bytes) -> Dict[str, Optional[int]]:
+        if len(data) < 6 or data[:4] != b"\xff\xff\xff\xff" or data[4] != 0x49:
+            raise ValueError("Unexpected A2S_INFO response.")
+
+        pos = 5
+        pos += 1  # protocol
+        _, pos = self._read_cstring(data, pos)  # name
+        _, pos = self._read_cstring(data, pos)  # map
+        _, pos = self._read_cstring(data, pos)  # folder
+        _, pos = self._read_cstring(data, pos)  # game
+        if pos + 7 > len(data):
+            raise ValueError("Truncated A2S_INFO response.")
+
+        pos += 2  # app id
+        online = data[pos]
+        pos += 1
+        max_players = data[pos]
+        pos += 1
+        pos += 5  # bots, server type, environment, visibility, VAC
+        _, pos = self._read_cstring(data, pos)  # version
+
+        queue = None
+        if pos < len(data):
+            edf = data[pos]
+            pos += 1
+            if edf & 0x80:
+                pos += 2
+            if edf & 0x10:
+                pos += 8
+            if edf & 0x40:
+                pos += 2
+                _, pos = self._read_cstring(data, pos)
+            if edf & 0x20:
+                keywords, pos = self._read_cstring(data, pos)
+                queue = self._queue_from_keywords(keywords)
+            if edf & 0x01:
+                pos += 8
+
+        if queue is None:
+            queue = self._queue_from_bytes(data[pos:])
+
+        return {"online": online, "max_players": max_players, "queue": queue}
+
+    async def _fetch_a2s_info(self, address: str) -> Dict[str, Optional[int]]:
+        host, port = self._parse_address(address)
+        data = await self._a2s_request(host, port, self.A2S_INFO_QUERY)
+        if len(data) >= 9 and data[:4] == b"\xff\xff\xff\xff" and data[4] == 0x41:
+            data = await self._a2s_request(host, port, self.A2S_INFO_QUERY + data[5:9])
+        return self._parse_a2s_info(data)
+
+    @staticmethod
     def _pick_int(data: Dict[str, Any], candidates: Tuple[str, ...]) -> Optional[int]:
         for key in candidates:
             if key in data:
@@ -114,10 +218,51 @@ class DayZMonitor(commands.Cog):
         return {
             "online": online,
             "max_players": max_players,
-            "queue": queue if queue is not None else 0,
+            "queue": queue,
             "free_slots": free_slots,
             "is_full": is_full,
         }
+
+    async def _fetch_status(self, address: str) -> Dict[str, Optional[int]]:
+        api_error = None
+        try:
+            payload = await self._fetch_server_data(address)
+            parsed = self._parse_population(payload)
+            if parsed["online"] is not None and parsed["max_players"] is not None and parsed["queue"] is not None:
+                return parsed
+        except Exception as exc:
+            api_error = exc
+            parsed = {
+                "online": None,
+                "max_players": None,
+                "queue": None,
+                "free_slots": None,
+                "is_full": None,
+            }
+
+        try:
+            a2s = await self._fetch_a2s_info(address)
+        except Exception:
+            log.debug("Failed to query A2S_INFO for %s.", address, exc_info=True)
+            if api_error is not None:
+                raise api_error
+            return parsed
+
+        for key in ("online", "max_players", "queue"):
+            if a2s.get(key) is not None:
+                parsed[key] = a2s[key]
+
+        online = parsed["online"]
+        max_players = parsed["max_players"]
+        if online is not None and max_players is not None:
+            parsed["free_slots"] = max(max_players - online, 0)
+            parsed["is_full"] = online >= max_players
+
+        return parsed
+
+    @staticmethod
+    def _format_queue(queue: Optional[int]) -> str:
+        return str(queue) if queue is not None else "unknown"
 
     def _format_status(self, name: str, address: str, parsed: Dict[str, Optional[int]]) -> str:
         online = parsed["online"]
@@ -128,15 +273,15 @@ class DayZMonitor(commands.Cog):
         if online is None or max_players is None:
             return (
                 f"**{name}** (`{address}`)\n"
-                f"Could not parse player/max values from API response.\n"
-                f"Queue: `{queue}`"
+                f"Could not parse player/max values from status response.\n"
+                f"Queue: `{self._format_queue(queue)}`"
             )
 
         return (
             f"**{name}** (`{address}`)\n"
             f"Online: `{online}/{max_players}`\n"
             f"Free slots: `{free_slots}`\n"
-            f"Queue: `{queue}`"
+            f"Queue: `{self._format_queue(queue)}`"
         )
 
     @staticmethod
@@ -264,10 +409,9 @@ class DayZMonitor(commands.Cog):
                 continue
 
             is_up = False
-            parsed: Dict[str, Optional[int]] = {"online": None, "max_players": None, "queue": 0}
+            parsed: Dict[str, Optional[int]] = {"online": None, "max_players": None, "queue": None}
             try:
-                payload = await self._fetch_server_data(address)
-                parsed = self._parse_population(payload)
+                parsed = await self._fetch_status(address)
                 is_up = parsed["online"] is not None and parsed["max_players"] is not None
             except Exception:
                 is_up = False
@@ -289,7 +433,7 @@ class DayZMonitor(commands.Cog):
                 await channel.send(
                     f":white_check_mark: **{name}** appears back online after restart.\n"
                     f"Online: `{parsed['online']}/{parsed['max_players']}` | "
-                    f"Queue: `{parsed['queue']}` | "
+                    f"Queue: `{self._format_queue(parsed['queue'])}` | "
                     f"Downtime: `{downtime}s`"
                 )
 
@@ -311,8 +455,7 @@ class DayZMonitor(commands.Cog):
                 continue
 
             try:
-                payload = await self._fetch_server_data(address)
-                parsed = self._parse_population(payload)
+                parsed = await self._fetch_status(address)
             except Exception:
                 log.exception(
                     "Failed to query DayZ server '%s' (%s) for guild %s (%s).",
@@ -337,7 +480,7 @@ class DayZMonitor(commands.Cog):
                         await channel.send(
                             f":rotating_light: **{name}** is now full.\n"
                             f"Online: `{parsed['online']}/{parsed['max_players']}` | "
-                            f"Queue: `{parsed['queue']}`"
+                            f"Queue: `{self._format_queue(parsed['queue'])}`"
                         )
                     server["last_full"] = True
                     changed = True
@@ -397,10 +540,9 @@ class DayZMonitor(commands.Cog):
             return
 
         try:
-            payload = await self._fetch_server_data(address)
-            parsed = self._parse_population(payload)
+            parsed = await self._fetch_status(address)
         except Exception as exc:
-            await ctx.send(f"Could not fetch API data for `{address}`: `{exc}`")
+            await ctx.send(f"Could not fetch status for `{address}`: `{exc}`")
             return
 
         servers[key] = {
@@ -550,8 +692,7 @@ class DayZMonitor(commands.Cog):
 
         address = server["address"]
         try:
-            payload = await self._fetch_server_data(address)
-            parsed = self._parse_population(payload)
+            parsed = await self._fetch_status(address)
         except Exception as exc:
             await ctx.send(f"Could not fetch status for `{address}`: `{exc}`")
             return
@@ -572,8 +713,7 @@ class DayZMonitor(commands.Cog):
             if not address:
                 continue
             try:
-                payload = await self._fetch_server_data(address)
-                parsed = self._parse_population(payload)
+                parsed = await self._fetch_status(address)
                 blocks.append(self._format_status(server.get("name", key), address, parsed))
             except Exception as exc:
                 blocks.append(f"**{server.get('name', key)}** (`{address}`)\nError: `{exc}`")

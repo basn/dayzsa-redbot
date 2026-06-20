@@ -119,7 +119,7 @@ class DayZMonitor(commands.Cog):
     def _queue_from_keywords(keywords: str) -> Optional[int]:
         for keyword in keywords.replace(";", ",").split(","):
             trimmed = keyword.strip()
-            match = re.fullmatch(r"lqs[:=\-\s]*(\d+)", trimmed, flags=re.IGNORECASE)
+            match = re.search(r"lqs[:=\-\s]*(\d+)", trimmed, flags=re.IGNORECASE)
             if match:
                 return int(match.group(1))
         return None

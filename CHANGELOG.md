@@ -11,3 +11,4 @@
 - Harden A2S socket + parse flow with retries and byte-level queue fallback so transient parse/transport issues no longer collapse to unknown queue.
 - Make A2S rules parsing resilient to malformed rule framing by falling back to raw byte scanning before returning unknown queue.
 - Preserve raw A2S queue hints after successful parse and broaden raw `lqs` pattern matching so `lqs` values formatted as separators or with spaces still parse.
+- Expand keyword parsing to search for `lqsN` anywhere within each token so edge-format fields (e.g. `foo;lqs19;bar`) still return a queue value.

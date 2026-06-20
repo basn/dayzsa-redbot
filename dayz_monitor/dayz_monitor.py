@@ -92,16 +92,21 @@ class DayZMonitor(commands.Cog):
             raise ValueError("Query port must be between 1 and 65535.")
         return host.strip("[]"), port
 
-    async def _a2s_request(self, host: str, port: int, payload: bytes, timeout: float = 5.0) -> bytes:
+    async def _a2s_request(self, host: str, port: int, payload: bytes, timeout: float = 5.0, retries: int = 2) -> bytes:
         loop = asyncio.get_running_loop()
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setblocking(False)
-        try:
-            await loop.sock_sendto(sock, payload, (host, port))
-            data, _ = await asyncio.wait_for(loop.sock_recvfrom(sock, 65535), timeout=timeout)
-            return data
-        finally:
-            sock.close()
+        last_error = None
+        for _ in range(max(1, retries)):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setblocking(False)
+            try:
+                await loop.sock_sendto(sock, payload, (host, port))
+                data, _ = await asyncio.wait_for(loop.sock_recvfrom(sock, 65535), timeout=timeout)
+                return data
+            except (OSError, asyncio.TimeoutError, TimeoutError) as exc:
+                last_error = exc
+            finally:
+                sock.close()
+        raise last_error
 
     @staticmethod
     def _read_cstring(data: bytes, pos: int) -> Tuple[str, int]:
@@ -120,18 +125,13 @@ class DayZMonitor(commands.Cog):
 
     @staticmethod
     def _queue_from_bytes(data: bytes) -> Optional[int]:
-        try:
-            text = data.decode("utf-8", "ignore")
-        except Exception:
-            return None
-
-        match = re.search(r"\blqs(\d+)\b", text, flags=re.IGNORECASE)
+        match = re.search(rb"lqs(\d+)", data, flags=re.IGNORECASE)
         if match:
-            return int(match.group(1))
+            return int(match.group(1).decode("ascii", "ignore"))
 
-        match = re.search(r"\bqueue[:=]?\s*(\d+)\b", text, flags=re.IGNORECASE)
+        match = re.search(rb"queue[:=\s]*(\d+)", data, flags=re.IGNORECASE)
         if match:
-            return int(match.group(1))
+            return int(match.group(1).decode("ascii", "ignore"))
         return None
 
     def _queue_from_rules(self, data: bytes) -> Optional[int]:
@@ -219,7 +219,12 @@ class DayZMonitor(commands.Cog):
         data = await self._a2s_request(host, port, self.A2S_INFO_QUERY)
         if len(data) >= 9 and data[:4] == b"\xff\xff\xff\xff" and data[4] == 0x41:
             data = await self._a2s_request(host, port, self.A2S_INFO_QUERY + data[5:9])
-        parsed = self._parse_a2s_info(data)
+
+        parsed = {"online": None, "max_players": None, "queue": self._queue_from_bytes(data)}
+        try:
+            parsed.update(self._parse_a2s_info(data))
+        except Exception:
+            log.debug("Failed to fully parse A2S_INFO for %s:%s; using raw queue fallback.", host, port, exc_info=True)
 
         if parsed.get("queue") is None:
             try:

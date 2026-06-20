@@ -3,6 +3,7 @@ import contextlib
 import logging
 import re
 import socket
+import struct
 import time
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple

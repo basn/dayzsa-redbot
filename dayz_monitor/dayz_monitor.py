@@ -227,25 +227,34 @@ class DayZMonitor(commands.Cog):
 
         return {"online": online, "max_players": max_players, "queue": queue}
 
-    async def _fetch_a2s_info(self, address: str) -> Dict[str, Optional[int]]:
+    async def _fetch_a2s_info(self, address: str, *, trace: bool = False) -> Dict[str, Optional[int]]:
         host, port = self._parse_address(address)
         try:
             data = await self._a2s_request(host, port, self.A2S_INFO_QUERY)
             if len(data) >= 9 and data[:4] == b"\xff\xff\xff\xff" and data[4] == 0x41:
                 data = await self._a2s_request(host, port, self.A2S_INFO_QUERY + data[5:9])
         except Exception:
+            if trace:
+                log.info("A2S_INFO request failed for %s; trying A2S_RULES fallback.", address, exc_info=True)
             try:
                 rules = await self._a2s_request(host, port, self.A2S_RULES_QUERY)
             except Exception:
+                if trace:
+                    log.info("A2S_RULES fallback request also failed for %s.", address, exc_info=True)
                 return {"online": None, "max_players": None, "queue": None}
 
             if len(rules) >= 9 and rules[:4] == b"\xff\xff\xff\xff" and rules[4] == 0x41:
                 try:
                     rules = await self._a2s_request(host, port, self.A2S_RULES_QUERY + rules[5:9])
                 except Exception:
+                    if trace:
+                        log.info("A2S_RULES challenge retry failed for %s.", address, exc_info=True)
                     return {"online": None, "max_players": None, "queue": None}
 
-            return {"online": None, "max_players": None, "queue": self._queue_from_rules(rules)}
+            queue = self._queue_from_rules(rules)
+            if trace and queue is None:
+                log.info("A2S_RULES payload for %s did not include queue-related fields.", address)
+            return {"online": None, "max_players": None, "queue": queue}
 
         parsed = {"online": None, "max_players": None, "queue": self._queue_from_bytes(data)}
         raw_queue = parsed["queue"]
@@ -259,22 +268,38 @@ class DayZMonitor(commands.Cog):
             else:
                 parsed["queue"] = raw_queue
         except Exception:
+            if trace:
+                log.info(
+                    "Failed to fully parse A2S_INFO payload for %s; keeping raw queue fallback (%s).",
+                    address,
+                    raw_queue,
+                    exc_info=True,
+                )
             log.debug("Failed to fully parse A2S_INFO for %s:%s; using raw queue fallback.", host, port, exc_info=True)
 
         if parsed.get("queue") is None:
+            if trace:
+                log.info("A2S_INFO payload had no queue; trying A2S_RULES fallback for %s.", address)
             try:
                 rules = await self._a2s_request(host, port, self.A2S_RULES_QUERY)
             except Exception:
+                if trace:
+                    log.info("A2S_RULES fallback after parse for %s failed.", address, exc_info=True)
                 return parsed
 
             if len(rules) >= 9 and rules[:4] == b"\xff\xff\xff\xff" and rules[4] == 0x41:
                 try:
                     rules = await self._a2s_request(host, port, self.A2S_RULES_QUERY + rules[5:9])
                 except Exception:
+                    if trace:
+                        log.info("A2S_RULES challenge retry after parse for %s failed.", address, exc_info=True)
                     return parsed
 
             if parsed.get("queue") is None:
-                parsed["queue"] = self._queue_from_rules(rules)
+                queue = self._queue_from_rules(rules)
+                if trace and queue is None:
+                    log.info("A2S_RULES fallback for %s did not expose queue fields.", address)
+                parsed["queue"] = queue
 
         return parsed
 
@@ -323,11 +348,13 @@ class DayZMonitor(commands.Cog):
             "is_full": is_full,
         }
 
-    async def _fetch_status(self, address: str) -> Dict[str, Optional[int]]:
+    async def _fetch_status(self, address: str, *, trace: bool = False) -> Dict[str, Optional[int]]:
         api_error = None
+        api_queue = None
         try:
             payload = await self._fetch_server_data(address)
             parsed = self._parse_population(payload)
+            api_queue = parsed["queue"]
             if parsed["online"] is not None and parsed["max_players"] is not None and parsed["queue"] is not None:
                 return parsed
         except Exception as exc:
@@ -341,9 +368,17 @@ class DayZMonitor(commands.Cog):
             }
 
         try:
-            a2s = await self._fetch_a2s_info(address)
+            a2s = await self._fetch_a2s_info(address, trace=trace)
         except Exception:
-            log.debug("Failed to query A2S_INFO for %s.", address, exc_info=True)
+            if trace:
+                if api_error is not None:
+                    log.info(
+                        "A2S_INFO+RULES diagnostics skipped for %s because API fetch had already failed.",
+                        address,
+                        exc_info=True,
+                    )
+                else:
+                    log.info("Failed to query A2S_INFO for status command on %s.", address, exc_info=True)
             if api_error is not None:
                 raise api_error
             return parsed
@@ -357,6 +392,16 @@ class DayZMonitor(commands.Cog):
         if online is not None and max_players is not None:
             parsed["free_slots"] = max(max_players - online, 0)
             parsed["is_full"] = online >= max_players
+
+        if trace and parsed["queue"] is None:
+            log.info(
+                "Queue still unresolved after API/A2S status resolution for %s (api_queue=%s, a2s_queue=%s, online=%s, max=%s).",
+                address,
+                api_queue,
+                a2s.get("queue"),
+                parsed["online"],
+                parsed["max_players"],
+            )
 
         return parsed
 
@@ -802,7 +847,7 @@ class DayZMonitor(commands.Cog):
 
         address = server["address"]
         try:
-            parsed = await self._fetch_status(address)
+            parsed = await self._fetch_status(address, trace=True)
         except Exception as exc:
             await ctx.send(f"Could not fetch status for `{address}`: `{exc}`")
             return
@@ -823,7 +868,7 @@ class DayZMonitor(commands.Cog):
             if not address:
                 continue
             try:
-                parsed = await self._fetch_status(address)
+                parsed = await self._fetch_status(address, trace=True)
                 blocks.append(self._format_status(server.get("name", key), address, parsed))
             except Exception as exc:
                 blocks.append(f"**{server.get('name', key)}** (`{address}`)\nError: `{exc}`")

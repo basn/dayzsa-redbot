@@ -31,7 +31,15 @@ This file tracks what has been changed in this repo during agent-assisted work.
   - Added `dayz restart <name> <hours>` to configure restart hours (`0-23`) per server.
   - Sends "back online" notifications only when at least one non-bot user is in voice.
   - Reuses each server's existing alert channel for restart notifications.
-  - Added restart schedule visibility in `dayz list`.
+- Added restart schedule visibility in `dayz list`.
+
+## 2026-06-20
+
+### Local Python/test workflow notes
+- Added a local test workflow recommendation for this environment:
+  - Python is available via Nix, not from `python`/`python3` in PATH.
+  - Run tests with: `nix run nixpkgs#python313 -- -m pytest`.
+  - Example targeted run: `nix run nixpkgs#python313 -- -m pytest -q tests/test_dayz_monitor.py`.
 
 ## Notes
 - This is a lightweight ops/history log for quick context.

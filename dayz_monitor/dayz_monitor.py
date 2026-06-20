@@ -21,6 +21,7 @@ class DayZMonitor(commands.Cog):
 
     API_BASE = "https://dayzsalauncher.com/api/v2/launcher/players"
     A2S_INFO_QUERY = b"\xff\xff\xff\xffTSource Engine Query\x00"
+    A2S_RULES_QUERY = b"\xff\xff\xff\xffV"
     NON_FULL_RESET_SECONDS = 10 * 60
     RESTART_WATCH_MAX_SECONDS = 30 * 60
 
@@ -126,6 +127,47 @@ class DayZMonitor(commands.Cog):
         match = re.search(r"\blqs(\d+)\b", text, flags=re.IGNORECASE)
         if match:
             return int(match.group(1))
+
+        match = re.search(r"\bqueue[:=]?\s*(\d+)\b", text, flags=re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        return None
+
+    def _queue_from_rules(self, data: bytes) -> Optional[int]:
+        if len(data) < 6 or data[:4] != b"\xff\xff\xff\xff" or data[4] != 0x45:
+            return None
+
+        pos = 5
+        try:
+            num_rules = struct.unpack_from("<H", data, pos)[0]
+        except struct.error:
+            return None
+        pos += 2
+
+        for _ in range(num_rules):
+            try:
+                key, pos = self._read_cstring(data, pos)
+                value, pos = self._read_cstring(data, pos)
+            except ValueError:
+                return None
+
+            if key:
+                queue = self._queue_from_keywords(key)
+                if queue is not None:
+                    return queue
+
+            if value:
+                queue = self._queue_from_keywords(value)
+                if queue is not None:
+                    return queue
+
+            normalized_key = key.lower().strip()
+            if normalized_key in {"queue", "waiting", "waitingplayers", "queueplayers", "lqs"}:
+                try:
+                    return int(value)
+                except ValueError:
+                    continue
+
         return None
 
     def _parse_a2s_info(self, data: bytes) -> Dict[str, Optional[int]]:
@@ -167,7 +209,7 @@ class DayZMonitor(commands.Cog):
                 pos += 8
 
         if queue is None:
-            queue = self._queue_from_bytes(data[pos:])
+            queue = self._queue_from_bytes(data)
 
         return {"online": online, "max_players": max_players, "queue": queue}
 
@@ -176,7 +218,24 @@ class DayZMonitor(commands.Cog):
         data = await self._a2s_request(host, port, self.A2S_INFO_QUERY)
         if len(data) >= 9 and data[:4] == b"\xff\xff\xff\xff" and data[4] == 0x41:
             data = await self._a2s_request(host, port, self.A2S_INFO_QUERY + data[5:9])
-        return self._parse_a2s_info(data)
+        parsed = self._parse_a2s_info(data)
+
+        if parsed.get("queue") is None:
+            try:
+                rules = await self._a2s_request(host, port, self.A2S_RULES_QUERY)
+            except Exception:
+                return parsed
+
+            if len(rules) >= 9 and rules[:4] == b"\xff\xff\xff\xff" and rules[4] == 0x41:
+                try:
+                    rules = await self._a2s_request(host, port, self.A2S_RULES_QUERY + rules[5:9])
+                except Exception:
+                    return parsed
+
+            if parsed.get("queue") is None:
+                parsed["queue"] = self._queue_from_rules(rules)
+
+        return parsed
 
     @staticmethod
     def _pick_int(data: Dict[str, Any], candidates: Tuple[str, ...]) -> Optional[int]:

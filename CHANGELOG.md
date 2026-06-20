@@ -2,6 +2,7 @@
 
 ## 2026-06-20
 
+- Add A2S_RULES fallback for queue extraction when `A2S_INFO` does not expose DayZ queue fields.
 - Improve queue handling for DayZ monitor by adding Steam A2S_INFO fallback queries for queue/status data.
 - Parse DayZ `lqsN` queue values from A2S payloads and expose queue when launcher API payloads omit it.
 - Add fallback queue extraction from raw A2S payload bytes to handle keyword-layout variations.

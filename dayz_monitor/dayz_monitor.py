@@ -117,7 +117,7 @@ class DayZMonitor(commands.Cog):
 
     @staticmethod
     def _queue_from_keywords(keywords: str) -> Optional[int]:
-        for keyword in keywords.split(","):
+        for keyword in keywords.replace(";", ",").split(","):
             trimmed = keyword.strip()
             match = re.fullmatch(r"lqs[:=\-\s]*(\d+)", trimmed, flags=re.IGNORECASE)
             if match:
@@ -126,7 +126,7 @@ class DayZMonitor(commands.Cog):
 
     @staticmethod
     def _queue_from_bytes(data: bytes) -> Optional[int]:
-        match = re.search(rb"lqs(\d+)", data, flags=re.IGNORECASE)
+        match = re.search(rb"lqs[:=\-\s]*(\d+)", data, flags=re.IGNORECASE)
         if match:
             return int(match.group(1).decode("ascii", "ignore"))
 
@@ -222,8 +222,16 @@ class DayZMonitor(commands.Cog):
             data = await self._a2s_request(host, port, self.A2S_INFO_QUERY + data[5:9])
 
         parsed = {"online": None, "max_players": None, "queue": self._queue_from_bytes(data)}
+        raw_queue = parsed["queue"]
         try:
-            parsed.update(self._parse_a2s_info(data))
+            parsed_info = self._parse_a2s_info(data)
+            for key in ("online", "max_players"):
+                if parsed_info.get(key) is not None:
+                    parsed[key] = parsed_info[key]
+            if parsed_info.get("queue") is not None:
+                parsed["queue"] = parsed_info["queue"]
+            else:
+                parsed["queue"] = raw_queue
         except Exception:
             log.debug("Failed to fully parse A2S_INFO for %s:%s; using raw queue fallback.", host, port, exc_info=True)
 

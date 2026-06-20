@@ -118,7 +118,8 @@ class DayZMonitor(commands.Cog):
     @staticmethod
     def _queue_from_keywords(keywords: str) -> Optional[int]:
         for keyword in keywords.split(","):
-            match = re.fullmatch(r"lqs(\d+)", keyword.strip(), re.IGNORECASE)
+            trimmed = keyword.strip()
+            match = re.fullmatch(r"lqs[:=\-\s]*(\d+)", trimmed, flags=re.IGNORECASE)
             if match:
                 return int(match.group(1))
         return None
@@ -136,13 +137,13 @@ class DayZMonitor(commands.Cog):
 
     def _queue_from_rules(self, data: bytes) -> Optional[int]:
         if len(data) < 6 or data[:4] != b"\xff\xff\xff\xff" or data[4] != 0x45:
-            return None
+            return self._queue_from_bytes(data)
 
         pos = 5
         try:
             num_rules = struct.unpack_from("<H", data, pos)[0]
         except struct.error:
-            return None
+            return self._queue_from_bytes(data)
         pos += 2
 
         for _ in range(num_rules):
@@ -150,7 +151,7 @@ class DayZMonitor(commands.Cog):
                 key, pos = self._read_cstring(data, pos)
                 value, pos = self._read_cstring(data, pos)
             except ValueError:
-                return None
+                return self._queue_from_bytes(data)
 
             if key:
                 queue = self._queue_from_keywords(key)
@@ -169,7 +170,7 @@ class DayZMonitor(commands.Cog):
                 except ValueError:
                     continue
 
-        return None
+        return self._queue_from_bytes(data)
 
     def _parse_a2s_info(self, data: bytes) -> Dict[str, Optional[int]]:
         if len(data) < 6 or data[:4] != b"\xff\xff\xff\xff" or data[4] != 0x49:

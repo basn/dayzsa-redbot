@@ -119,18 +119,30 @@ class DayZMonitor(commands.Cog):
     def _queue_from_keywords(keywords: str) -> Optional[int]:
         for keyword in keywords.replace(";", ",").split(","):
             trimmed = keyword.strip()
-            match = re.search(r"lqs[:=\-\s]*(\d+)", trimmed, flags=re.IGNORECASE)
+            match = re.search(
+                r"(?:lqs|queue|queueplayers|waiting(?:players)?)[\s:=\-\x00,;]*(\d+)",
+                trimmed,
+                flags=re.IGNORECASE,
+            )
             if match:
                 return int(match.group(1))
         return None
 
     @staticmethod
     def _queue_from_bytes(data: bytes) -> Optional[int]:
-        match = re.search(rb"lqs[:=\-\s]*(\d+)", data, flags=re.IGNORECASE)
+        match = re.search(
+            rb"(?:lqs|queue|queueplayers|waiting(?:players)?)[\s:=\-\x00,;]*(\d+)",
+            data,
+            flags=re.IGNORECASE,
+        )
         if match:
             return int(match.group(1).decode("ascii", "ignore"))
 
-        match = re.search(rb"queue[:=\s]*(\d+)", data, flags=re.IGNORECASE)
+        match = re.search(
+            rb"queue(?:players)?[\s:=\-\x00,;]*(\d+)",
+            data,
+            flags=re.IGNORECASE,
+        )
         if match:
             return int(match.group(1).decode("ascii", "ignore"))
         return None
@@ -294,7 +306,7 @@ class DayZMonitor(commands.Cog):
         )
         queue = self._pick_int(
             source,
-            ("queue", "queuePlayers", "Queue", "waiting", "waitingPlayers"),
+            ("queue", "lqs", "queuePlayers", "Queue", "waiting", "waitingPlayers"),
         )
 
         free_slots = None

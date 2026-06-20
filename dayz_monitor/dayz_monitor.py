@@ -217,9 +217,23 @@ class DayZMonitor(commands.Cog):
 
     async def _fetch_a2s_info(self, address: str) -> Dict[str, Optional[int]]:
         host, port = self._parse_address(address)
-        data = await self._a2s_request(host, port, self.A2S_INFO_QUERY)
-        if len(data) >= 9 and data[:4] == b"\xff\xff\xff\xff" and data[4] == 0x41:
-            data = await self._a2s_request(host, port, self.A2S_INFO_QUERY + data[5:9])
+        try:
+            data = await self._a2s_request(host, port, self.A2S_INFO_QUERY)
+            if len(data) >= 9 and data[:4] == b"\xff\xff\xff\xff" and data[4] == 0x41:
+                data = await self._a2s_request(host, port, self.A2S_INFO_QUERY + data[5:9])
+        except Exception:
+            try:
+                rules = await self._a2s_request(host, port, self.A2S_RULES_QUERY)
+            except Exception:
+                return {"online": None, "max_players": None, "queue": None}
+
+            if len(rules) >= 9 and rules[:4] == b"\xff\xff\xff\xff" and rules[4] == 0x41:
+                try:
+                    rules = await self._a2s_request(host, port, self.A2S_RULES_QUERY + rules[5:9])
+                except Exception:
+                    return {"online": None, "max_players": None, "queue": None}
+
+            return {"online": None, "max_players": None, "queue": self._queue_from_rules(rules)}
 
         parsed = {"online": None, "max_players": None, "queue": self._queue_from_bytes(data)}
         raw_queue = parsed["queue"]
@@ -335,8 +349,10 @@ class DayZMonitor(commands.Cog):
         return parsed
 
     @staticmethod
-    def _format_queue(queue: Optional[int]) -> str:
-        return str(queue) if queue is not None else "unknown"
+    def _format_queue_if_present(queue: Optional[int]) -> Optional[str]:
+        if queue is None:
+            return None
+        return f"Queue: `{queue}`"
 
     def _format_status(self, name: str, address: str, parsed: Dict[str, Optional[int]]) -> str:
         online = parsed["online"]
@@ -345,18 +361,21 @@ class DayZMonitor(commands.Cog):
         free_slots = parsed["free_slots"]
 
         if online is None or max_players is None:
-            return (
-                f"**{name}** (`{address}`)\n"
-                f"Could not parse player/max values from status response.\n"
-                f"Queue: `{self._format_queue(queue)}`"
-            )
+            lines = [
+                f"**{name}** (`{address}`)",
+                "Could not parse player/max values from status response.",
+            ]
+        else:
+            lines = [
+                f"**{name}** (`{address}`)",
+                f"Online: `{online}/{max_players}`",
+                f"Free slots: `{free_slots}`",
+            ]
 
-        return (
-            f"**{name}** (`{address}`)\n"
-            f"Online: `{online}/{max_players}`\n"
-            f"Free slots: `{free_slots}`\n"
-            f"Queue: `{self._format_queue(queue)}`"
-        )
+        queue_line = self._format_queue_if_present(queue)
+        if queue_line is not None:
+            lines.append(queue_line)
+        return "\n".join(lines)
 
     @staticmethod
     def _has_human_in_voice(guild: discord.Guild) -> bool:
@@ -507,7 +526,7 @@ class DayZMonitor(commands.Cog):
                 await channel.send(
                     f":white_check_mark: **{name}** appears back online after restart.\n"
                     f"Online: `{parsed['online']}/{parsed['max_players']}` | "
-                    f"Queue: `{self._format_queue(parsed['queue'])}` | "
+                    f"{self._format_queue_if_present(parsed['queue']) + ' | ' if parsed['queue'] is not None else ''}"
                     f"Downtime: `{downtime}s`"
                 )
 
@@ -551,10 +570,15 @@ class DayZMonitor(commands.Cog):
                 if not last_full:
                     channel = guild.get_channel(channel_id)
                     if channel:
+                        queue_suffix = (
+                            f" | {self._format_queue_if_present(parsed['queue'])}"
+                            if parsed["queue"] is not None
+                            else ""
+                        )
                         await channel.send(
                             f":rotating_light: **{name}** is now full.\n"
-                            f"Online: `{parsed['online']}/{parsed['max_players']}` | "
-                            f"Queue: `{self._format_queue(parsed['queue'])}`"
+                            f"Online: `{parsed['online']}/{parsed['max_players']}`"
+                            f"{queue_suffix}"
                         )
                     server["last_full"] = True
                     changed = True

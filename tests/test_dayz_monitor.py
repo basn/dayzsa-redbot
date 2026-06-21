@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import struct
 import sys
+import os
 from types import ModuleType
 from typing import Any, Dict, Optional
+
+import pytest
 
 
 def _install_redbot_stubs() -> None:
@@ -166,6 +170,61 @@ def _load_dayz_monitor_class():
     return DayZMonitor
 
 
+def _make_rules_payload(entries):
+    def _cstring(value: str) -> bytes:
+        return value.encode("utf-8") + b"\x00"
+
+    payload = b"".join(_cstring(key) + _cstring(str(value)) for key, value in entries)
+    return b"\xff\xff\xff\xffE" + struct.pack("<H", len(entries)) + payload
+
+
+class _FakeTextChannel:
+    def __init__(self, channel_id: int):
+        self.id = channel_id
+        self.sent_messages = []
+
+    async def send(self, content: str):
+        self.sent_messages.append(content)
+
+
+class _FakeGuild:
+    def __init__(self, name: str, channel: Optional[_FakeTextChannel] = None, guild_id: int = 1):
+        self.name = name
+        self.id = guild_id
+        self._channel = channel
+
+    def get_channel(self, channel_id: int):
+        if self._channel and self._channel.id == channel_id:
+            return self._channel
+        return None
+
+
+class _FakeServersConfig:
+    def __init__(self, data: Dict[str, Dict[str, Any]]):
+        self.data = data
+        self.set_calls = 0
+
+    async def __call__(self):
+        return self.data
+
+    async def set(self, data: Dict[str, Dict[str, Any]]):
+        self.set_calls += 1
+        self.data = data
+
+
+class _FakeGuildConfig:
+    def __init__(self, data: Dict[str, Dict[str, Any]]):
+        self.servers = _FakeServersConfig(data)
+
+
+class _FakeConfig:
+    def __init__(self, data: Dict[str, Dict[str, Any]]):
+        self._servers_config = _FakeGuildConfig(data)
+
+    def guild(self, _guild):
+        return self._servers_config
+
+
 def test_fetch_status_trace_logs_unresolved_queue(caplog):
     DayZMonitor = _load_dayz_monitor_class()
     monitor = DayZMonitor.__new__(DayZMonitor)
@@ -213,4 +272,256 @@ def test_fetch_a2s_info_rules_fallback_queue_missing_logs(caplog):
         parsed = asyncio.run(monitor._fetch_a2s_info("127.0.0.1:27017", trace=True))
 
     assert parsed == {"online": None, "max_players": None, "queue": None}
-    assert any("A2S_RULES payload for 127.0.0.1:27017 did not include queue-related fields." in record.message for record in caplog.records)
+    assert any(
+        "A2S_RULES payload for 127.0.0.1:27017 did not include queue-related fields." in record.message
+        for record in caplog.records
+    )
+
+
+def test_queue_parsers_cover_key_variants_and_bytes_matches():
+    DayZMonitor = _load_dayz_monitor_class()
+    monitor = DayZMonitor.__new__(DayZMonitor)
+
+    assert monitor._queue_from_keywords("lqs=17;waitingplayers:4") == 17
+    assert monitor._queue_from_keywords("noise | queue:22;") == 22
+    assert monitor._queue_from_bytes(b"prefix lqs:31,queueplayers=7") == 31
+    assert monitor._queue_from_bytes(b"foo QUEUEPLAYERS:12 baz") == 12
+    assert monitor._queue_from_bytes(b"nq  =  x") is None
+
+
+def test_queue_from_rules_parses_known_fields_and_fallbacks():
+    DayZMonitor = _load_dayz_monitor_class()
+    monitor = DayZMonitor.__new__(DayZMonitor)
+
+    assert monitor._queue_from_rules(_make_rules_payload([("hostname", "x"), ("queue", "8"), ("lqs", "2")])) == 8
+    assert monitor._queue_from_rules(_make_rules_payload([("waiting", "12")])) == 12
+    assert monitor._queue_from_rules(_make_rules_payload([("note", "queueplayers:9")])) == 9
+    assert monitor._queue_from_rules(_make_rules_payload([("note", "n/a")])) is None
+
+
+def test_fetch_status_uses_api_values_when_complete():
+    DayZMonitor = _load_dayz_monitor_class()
+    monitor = DayZMonitor.__new__(DayZMonitor)
+
+    async def fetch_server_data(_address: str):
+        return {"players": 50, "maxPlayers": 100, "queue": 3}
+
+    called = {"a2s": 0}
+
+    async def fetch_a2s_info(_address: str, trace: bool = False):
+        called["a2s"] += 1
+        return {"online": 1, "max_players": 2, "queue": 9}
+
+    monitor._fetch_server_data = fetch_server_data  # type: ignore[attr-defined]
+    monitor._fetch_a2s_info = fetch_a2s_info  # type: ignore[attr-defined]
+
+    parsed = asyncio.run(monitor._fetch_status("127.0.0.1:27017"))
+
+    assert parsed == {
+        "online": 50,
+        "max_players": 100,
+        "queue": 3,
+        "free_slots": 50,
+        "is_full": False,
+    }
+    assert called["a2s"] == 0
+
+
+def test_fetch_status_merges_queue_from_a2s_when_api_no_queue():
+    DayZMonitor = _load_dayz_monitor_class()
+    monitor = DayZMonitor.__new__(DayZMonitor)
+
+    async def fetch_server_data(_address: str):
+        return {"players": 10, "maxplayers": 20}
+
+    async def fetch_a2s_info(_address: str, trace: bool = False):
+        return {"online": 8, "max_players": 20, "queue": 4}
+
+    monitor._fetch_server_data = fetch_server_data  # type: ignore[attr-defined]
+    monitor._fetch_a2s_info = fetch_a2s_info  # type: ignore[attr-defined]
+
+    parsed = asyncio.run(monitor._fetch_status("127.0.0.1:27017"))
+
+    assert parsed["online"] == 8
+    assert parsed["max_players"] == 20
+    assert parsed["queue"] == 4
+    assert parsed["free_slots"] == 12
+    assert parsed["is_full"] is False
+
+
+def test_fetch_status_rethrows_api_failure_when_a2s_fails():
+    DayZMonitor = _load_dayz_monitor_class()
+    monitor = DayZMonitor.__new__(DayZMonitor)
+
+    async def fetch_server_data(_address: str):
+        raise RuntimeError("api failure")
+
+    async def fetch_a2s_info(_address: str, trace: bool = False):
+        raise RuntimeError("a2s failure")
+
+    monitor._fetch_server_data = fetch_server_data  # type: ignore[attr-defined]
+    monitor._fetch_a2s_info = fetch_a2s_info  # type: ignore[attr-defined]
+
+    try:
+        asyncio.run(monitor._fetch_status("127.0.0.1:27017"))
+    except RuntimeError as exc:
+        assert "api failure" in str(exc)
+    else:
+        raise AssertionError("Expected RuntimeError from API failure path")
+
+
+def test_check_guild_sends_full_alert_once_with_queue_suffix():
+    DayZMonitor = _load_dayz_monitor_class()
+    monitor = DayZMonitor.__new__(DayZMonitor)
+
+    channel = _FakeTextChannel(100)
+    guild = _FakeGuild("guild", channel)
+    server_state = {
+        "alpha": {
+            "name": "alpha",
+            "address": "127.0.0.1:27017",
+            "channel_id": 100,
+            "last_full": False,
+            "not_full_since": None,
+        }
+    }
+    monitor.config = _FakeConfig(server_state)
+
+    statuses = [
+        {"online": 20, "max_players": 20, "queue": 4, "free_slots": 0, "is_full": True},
+        {"online": 20, "max_players": 20, "queue": 5, "free_slots": 0, "is_full": True},
+    ]
+    idx = 0
+
+    async def fetch_status(_address: str, trace: bool = False):
+        nonlocal idx
+        value = statuses[idx]
+        idx = min(idx + 1, len(statuses) - 1)
+        return value
+
+    monitor._fetch_status = fetch_status  # type: ignore[attr-defined]
+
+    asyncio.run(monitor._check_guild(guild))
+    asyncio.run(monitor._check_guild(guild))
+
+    assert len(channel.sent_messages) == 1
+    assert "is now full" in channel.sent_messages[0]
+    assert "Queue: `4`" in channel.sent_messages[0]
+    assert server_state["alpha"]["last_full"] is True
+    assert server_state["alpha"]["not_full_since"] is None
+
+    guild_config = monitor.config.guild(guild)
+    assert guild_config.servers.set_calls == 1
+
+
+def test_check_guild_short_flap_does_not_realert_full():
+    DayZMonitor = _load_dayz_monitor_class()
+    monitor = DayZMonitor.__new__(DayZMonitor)
+
+    channel = _FakeTextChannel(100)
+    guild = _FakeGuild("guild", channel)
+    server_state = {
+        "alpha": {
+            "name": "alpha",
+            "address": "127.0.0.1:27017",
+            "channel_id": 100,
+            "last_full": False,
+            "not_full_since": None,
+        }
+    }
+    monitor.config = _FakeConfig(server_state)
+
+    statuses = [
+        {"online": 20, "max_players": 20, "queue": 4, "free_slots": 0, "is_full": True},
+        {"online": 19, "max_players": 20, "queue": 4, "free_slots": 1, "is_full": False},
+        {"online": 20, "max_players": 20, "queue": 4, "free_slots": 0, "is_full": True},
+    ]
+    idx = 0
+
+    async def fetch_status(_address: str, trace: bool = False):
+        nonlocal idx
+        value = statuses[idx]
+        idx = min(idx + 1, len(statuses) - 1)
+        return value
+
+    monitor._fetch_status = fetch_status  # type: ignore[attr-defined]
+
+    asyncio.run(monitor._check_guild(guild))
+    asyncio.run(monitor._check_guild(guild))
+    asyncio.run(monitor._check_guild(guild))
+
+    assert len(channel.sent_messages) == 1
+    assert server_state["alpha"]["last_full"] is True
+    assert server_state["alpha"]["not_full_since"] is None
+
+
+def test_check_guild_rearms_full_state_after_non_full_ttl():
+    DayZMonitor = _load_dayz_monitor_class()
+    monitor = DayZMonitor.__new__(DayZMonitor)
+
+    channel = _FakeTextChannel(100)
+    guild = _FakeGuild("guild", channel)
+    server_state = {
+        "alpha": {
+            "name": "alpha",
+            "address": "127.0.0.1:27017",
+            "channel_id": 100,
+            "last_full": True,
+            "not_full_since": -1,
+        }
+    }
+    monitor.config = _FakeConfig(server_state)
+    async def fetch_status(_address: str, trace: bool = False):
+        return {"online": 19, "max_players": 20, "queue": None, "free_slots": 1, "is_full": False}
+
+    monitor._fetch_status = fetch_status  # type: ignore[attr-defined]
+    asyncio.run(monitor._check_guild(guild))
+
+    assert server_state["alpha"]["last_full"] is False
+    assert server_state["alpha"]["not_full_since"] is None
+
+
+def _live_server_address() -> str:
+    return os.environ.get("DAYZ_MONITOR_LIVE_SERVER", "").strip()
+
+
+@pytest.mark.skipif(not _live_server_address(), reason="Set DAYZ_MONITOR_LIVE_SERVER to run live integration checks.")
+def test_fetch_status_live_against_real_server():
+    DayZMonitor = _load_dayz_monitor_class()
+    monitor = DayZMonitor.__new__(DayZMonitor)
+
+    address = _live_server_address()
+    parsed = asyncio.run(monitor._fetch_status(address, trace=True))
+
+    assert parsed["online"] is not None
+    assert parsed["max_players"] is not None
+    assert parsed["is_full"] is not None
+    if parsed["online"] is not None and parsed["max_players"] is not None:
+        assert isinstance(parsed["online"], int)
+        assert isinstance(parsed["max_players"], int)
+        assert parsed["online"] >= 0
+        assert parsed["max_players"] >= 0
+
+    if parsed["queue"] is not None:
+        assert isinstance(parsed["queue"], int)
+        assert parsed["queue"] >= 0
+
+
+@pytest.mark.skipif(not _live_server_address(), reason="Set DAYZ_MONITOR_LIVE_SERVER to run live integration checks.")
+def test_fetch_a2s_info_live_against_real_server():
+    DayZMonitor = _load_dayz_monitor_class()
+    monitor = DayZMonitor.__new__(DayZMonitor)
+
+    address = _live_server_address()
+    parsed = asyncio.run(monitor._fetch_a2s_info(address, trace=True))
+
+    assert parsed["online"] is not None or parsed["max_players"] is not None or parsed["queue"] is not None
+    if parsed["online"] is not None:
+        assert isinstance(parsed["online"], int)
+        assert parsed["online"] >= 0
+    if parsed["max_players"] is not None:
+        assert isinstance(parsed["max_players"], int)
+        assert parsed["max_players"] >= 0
+    if parsed["queue"] is not None:
+        assert isinstance(parsed["queue"], int)
+        assert parsed["queue"] >= 0

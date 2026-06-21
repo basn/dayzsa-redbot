@@ -41,3 +41,11 @@ Minimal Redbot cog repo for monitoring DayZ SA Launcher server population and qu
 The DayZ SA Launcher player endpoint only returns online and max player counts for
 some servers. This cog also queries the server directly with Steam A2S_INFO and
 reads DayZ's `lqsN` keyword when present, where `N` is the live queue size.
+
+## Local test notes
+
+- Unit tests are offline and do not require any live servers:
+  - `PYTHONPATH=. nix run nixpkgs#python313Packages.pytest -- -q tests/test_dayz_monitor.py`
+- Run live integration checks against one real server by setting:
+  - `DAYZ_MONITOR_LIVE_SERVER=<host:query_port>`
+  - `PYTHONPATH=. nix run nixpkgs#python313Packages.pytest -- -q tests/test_dayz_monitor.py -k live`

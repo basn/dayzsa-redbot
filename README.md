@@ -35,6 +35,9 @@ Minimal Redbot cog repo for monitoring DayZ SA Launcher server population and qu
   - `[p]dayz channel <name> <#channel>`
 - Set check interval (seconds, min 30):
   - `[p]dayz interval <seconds>`
+- Publish one configured server's population and queue in the bot's Discord status:
+  - `[p]dayz presence <name>`
+  - Disable with `[p]dayz presence off`
 
 ## Queue Status
 

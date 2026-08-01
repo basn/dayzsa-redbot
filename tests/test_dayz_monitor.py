@@ -327,6 +327,23 @@ def test_queue_parsers_cover_key_variants_and_bytes_matches():
     assert monitor._queue_from_bytes(b"nq  =  x") is None
 
 
+def test_format_presence_includes_queue_when_available():
+    DayZMonitor = _load_dayz_monitor_class()
+
+    assert DayZMonitor._format_presence(
+        "Aftermath",
+        {"online": 100, "max_players": 100, "queue": 7},
+    ) == "Aftermath: 100/100 | Queue: 7"
+    assert DayZMonitor._format_presence(
+        "Aftermath",
+        {"online": 99, "max_players": 100, "queue": None},
+    ) == "Aftermath: 99/100"
+    assert DayZMonitor._format_presence(
+        "Aftermath",
+        {"online": None, "max_players": None, "queue": None},
+    ) == "Aftermath: offline"
+
+
 def test_queue_from_rules_parses_known_fields_and_fallbacks():
     DayZMonitor = _load_dayz_monitor_class()
     monitor = DayZMonitor.__new__(DayZMonitor)

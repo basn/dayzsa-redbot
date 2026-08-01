@@ -30,6 +30,9 @@ class DayZMonitor(commands.Cog):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=9013470171, force_registration=True)
         self.config.register_guild(servers={}, check_interval=60)
+        # Discord presence is bot-wide, so only one configured server can
+        # drive it at a time.
+        self.config.register_global(presence_server=None)
         self.session: Optional[aiohttp.ClientSession] = None
         self._task: Optional[asyncio.Task] = None
         self._restart_task: Optional[asyncio.Task] = None
@@ -490,6 +493,7 @@ class DayZMonitor(commands.Cog):
                 for guild in self.bot.guilds:
                     await self._check_guild(guild)
                     await asyncio.sleep(1)
+                await self._update_presence()
                 # Use shortest configured interval across guilds for responsiveness.
                 intervals = []
                 for guild in self.bot.guilds:
@@ -502,6 +506,46 @@ class DayZMonitor(commands.Cog):
             except Exception:
                 log.exception("Unhandled exception in DayZ monitor loop; retrying in 30s.")
                 await asyncio.sleep(30)
+
+    @staticmethod
+    def _format_presence(name: str, parsed: Dict[str, Optional[int]]) -> str:
+        online = parsed.get("online")
+        max_players = parsed.get("max_players")
+        queue = parsed.get("queue")
+        if online is None or max_players is None:
+            return f"{name}: offline"
+
+        text = f"{name}: {online}/{max_players}"
+        if queue is not None:
+            text += f" | Queue: {queue}"
+        return text
+
+    async def _update_presence(self):
+        configured = await self.config.presence_server()
+        if not isinstance(configured, dict):
+            return
+
+        guild_id = configured.get("guild_id")
+        key = configured.get("server")
+        if not isinstance(guild_id, int) or not isinstance(key, str):
+            return
+
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return
+        servers = await self.config.guild(guild).servers()
+        server = servers.get(key)
+        if not isinstance(server, dict) or not server.get("address"):
+            return
+
+        try:
+            parsed = await self._fetch_status(server["address"])
+            text = self._format_presence(server.get("name", key), parsed)
+        except Exception:
+            log.exception("Failed to update Discord presence from DayZ server '%s'.", key)
+            text = f"{server.get('name', key)}: offline"
+
+        await self.bot.change_presence(activity=discord.Game(name=text))
 
     async def _restart_watch_loop(self):
         await self.bot.wait_until_red_ready()
@@ -778,6 +822,32 @@ class DayZMonitor(commands.Cog):
         seconds = max(30, seconds)
         await self.config.guild(ctx.guild).check_interval.set(seconds)
         await ctx.send(f"Check interval set to `{seconds}` seconds.")
+
+    @dayz_group.command(name="presence", aliases=["botstatus"])
+    @commands.admin_or_permissions(manage_guild=True)
+    async def dayz_presence(self, ctx: commands.Context, name: str):
+        """Publish one server's population and queue in the bot's Discord status.
+
+        Example: [p]dayz presence main
+        Disable: [p]dayz presence off
+        """
+        if name.lower() in {"remove", "clear", "off", "none", "disable", "disabled"}:
+            await self.config.presence_server.set(None)
+            await self.bot.change_presence(activity=None)
+            await ctx.send("DayZ Discord status publishing disabled.")
+            return
+
+        key = name.lower()
+        servers = await self.config.guild(ctx.guild).servers()
+        if key not in servers:
+            await ctx.send(f"No monitored server named `{key}`.")
+            return
+
+        await self.config.presence_server.set({"guild_id": ctx.guild.id, "server": key})
+        await self._update_presence()
+        await ctx.send(
+            f"Bot status will now show population and queue for `{servers[key].get('name', key)}`."
+        )
 
     @dayz_group.command(name="restart")
     @commands.admin_or_permissions(manage_guild=True)

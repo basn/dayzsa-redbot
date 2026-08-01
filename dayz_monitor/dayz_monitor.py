@@ -93,16 +93,19 @@ class DayZMonitor(commands.Cog):
         return host.strip("[]"), port
 
     async def _a2s_request(self, host: str, port: int, payload: bytes, timeout: float = 5.0, retries: int = 2) -> bytes:
-        loop = asyncio.get_running_loop()
         last_error = None
         for _ in range(max(1, retries)):
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setblocking(False)
             try:
-                await loop.sock_sendto(sock, payload, (host, port))
-                data, _ = await asyncio.wait_for(loop.sock_recvfrom(sock, 65535), timeout=timeout)
+                # Redbot uses uvloop, which raises NotImplementedError for
+                # loop.sock_sendto() on this UDP socket.  Run the short,
+                # blocking datagram exchange in a worker so it works with both
+                # asyncio's default loop and uvloop without blocking Discord.
+                sock.settimeout(timeout)
+                await asyncio.to_thread(sock.sendto, payload, (host, port))
+                data, _ = await asyncio.to_thread(sock.recvfrom, 65535)
                 return data
-            except (OSError, asyncio.TimeoutError, TimeoutError) as exc:
+            except (OSError, TimeoutError) as exc:
                 last_error = exc
             finally:
                 sock.close()

@@ -278,6 +278,44 @@ def test_fetch_a2s_info_rules_fallback_queue_missing_logs(caplog):
     )
 
 
+def test_a2s_request_works_without_event_loop_udp_methods(monkeypatch):
+    DayZMonitor = _load_dayz_monitor_class()
+    monitor = DayZMonitor.__new__(DayZMonitor)
+    module = sys.modules[DayZMonitor.__module__]
+    calls = []
+
+    class FakeSocket:
+        def settimeout(self, timeout):
+            calls.append(("timeout", timeout))
+
+        def sendto(self, payload, address):
+            calls.append(("sendto", payload, address))
+
+        def recvfrom(self, size):
+            calls.append(("recvfrom", size))
+            return b"response", ("127.0.0.1", 27017)
+
+        def close(self):
+            calls.append(("close",))
+
+    async def exercise():
+        monkeypatch.setattr(module.socket, "socket", lambda *_args: FakeSocket())
+        try:
+            return await monitor._a2s_request("127.0.0.1", 27017, b"query", timeout=2, retries=1)
+        finally:
+            monkeypatch.undo()
+
+    result = asyncio.run(exercise())
+
+    assert result == b"response"
+    assert calls == [
+        ("timeout", 2),
+        ("sendto", b"query", ("127.0.0.1", 27017)),
+        ("recvfrom", 65535),
+        ("close",),
+    ]
+
+
 def test_queue_parsers_cover_key_variants_and_bytes_matches():
     DayZMonitor = _load_dayz_monitor_class()
     monitor = DayZMonitor.__new__(DayZMonitor)

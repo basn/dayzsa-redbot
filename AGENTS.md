@@ -41,6 +41,17 @@ This file tracks what has been changed in this repo during agent-assisted work.
   - Run tests with: `nix run nixpkgs#python313 -- -m pytest`.
   - Example targeted run: `nix run nixpkgs#python313 -- -m pytest -q tests/test_dayz_monitor.py`.
 
+## 2026-08-02
+
+### Aftermath public statistics and team roster
+- Commit: `8ce3295`
+- Files: `dayz_monitor/dayz_monitor.py`, `tests/test_dayz_monitor.py`, `README.md`
+- Change summary:
+  - Added per-monitored-server Aftermath API UUID configuration with `dayz aftermath`.
+  - Added public `dayz group` and `dayz player` statistics lookups.
+  - Added a per-guild team roster of up to six SteamID64s and `dayz teamstats` aggregate reporting.
+- Validation: `PYTHONPATH=. nix run nixpkgs#python313Packages.pytest -- -q tests/test_dayz_monitor.py` returned `16 passed, 2 skipped`.
+
 ## Notes
 - This is a lightweight ops/history log for quick context.
 - Keep entries append-only and include commit IDs for traceability.

@@ -327,6 +327,75 @@ def test_queue_parsers_cover_key_variants_and_bytes_matches():
     assert monitor._queue_from_bytes(b"nq  =  x") is None
 
 
+def test_format_aftermath_stats_handles_group_and_player_field_names():
+    DayZMonitor = _load_dayz_monitor_class()
+
+    group = DayZMonitor._format_aftermath_stats(
+        "Old Guys Gaming",
+        {"total_kills": 262, "total_deaths": 102, "kd_ratio": 2.57, "longest_kill": 498.5},
+    )
+    player = DayZMonitor._format_aftermath_stats(
+        "Steam ID 76561198080332488",
+        {"TotalKills": 42, "TotalDeaths": 15, "KDRatio": "2.8000", "LongestKill": 253.83},
+    )
+
+    assert "Kills: `262` | Deaths: `102` | K/D: `2.57`" in group
+    assert "Longest kill: `498.5 m`" in group
+    assert "Kills: `42` | Deaths: `15` | K/D: `2.8000`" in player
+
+
+def test_aftermath_stat_paths_url_encode_names_and_ids():
+    DayZMonitor = _load_dayz_monitor_class()
+    monitor = DayZMonitor.__new__(DayZMonitor)
+    paths = []
+
+    async def fetch(path: str):
+        paths.append(path)
+        return {}
+
+    monitor._fetch_aftermath_data = fetch  # type: ignore[attr-defined]
+    asyncio.run(monitor._fetch_aftermath_group_stats("server/id", "Old Guys Gaming"))
+    asyncio.run(monitor._fetch_aftermath_player_stats("server/id", "76561198080332488"))
+
+    assert paths == [
+        "group/getStats/Old%20Guys%20Gaming/server%2Fid",
+        "player/getStats/76561198080332488/server%2Fid",
+    ]
+
+
+def test_team_member_normalization_discards_invalid_and_duplicate_entries():
+    DayZMonitor = _load_dayz_monitor_class()
+
+    team = DayZMonitor._normalize_team_members(
+        [
+            {"steam_id": "76561198080332488", "name": "Basn"},
+            {"steam_id": "76561198080332488", "name": "Duplicate"},
+            {"steam_id": "invalid", "name": "Invalid"},
+            {"steam_id": "76561198000000000"},
+        ]
+    )
+
+    assert team == [
+        {"steam_id": "76561198080332488", "name": "Basn"},
+        {"steam_id": "76561198000000000", "name": "76561198000000000"},
+    ]
+
+
+def test_format_team_stats_aggregates_members():
+    DayZMonitor = _load_dayz_monitor_class()
+
+    formatted = DayZMonitor._format_team_stats(
+        [
+            ({"name": "Basn"}, {"total_kills": 42, "total_deaths": 15, "longest_kill": 253.83}),
+            ({"name": "Teammate"}, {"total_kills": 8, "total_deaths": 0, "longest_kill": 100}),
+        ]
+    )
+
+    assert "Total: `50` K / `15` D | `3.33` K/D | Longest kill: `253.83 m`" in formatted
+    assert "**Basn**: `42` K / `15` D | `2.80` K/D" in formatted
+    assert "**Teammate**: `8` K / `0` D | `∞` K/D" in formatted
+
+
 def test_format_presence_includes_queue_when_available():
     DayZMonitor = _load_dayz_monitor_class()
 

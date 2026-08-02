@@ -27,6 +27,27 @@ Minimal Redbot cog repo for monitoring DayZ SA Launcher server population and qu
 - List configured servers:
   - `[p]dayz list`
 
+## Aftermath Statistics
+
+For an Aftermath server, an admin first records the server's public API UUID:
+
+- `[p]dayz aftermath main <server-id>`
+
+Anyone can then look up public statistics for that configured server:
+
+- Group statistics: `[p]dayz group main <group name>`
+- Player statistics by SteamID64: `[p]dayz player main <steam-id>`
+
+You can also maintain up to six SteamID64s as a Discord-server team roster:
+
+- Add a player (admin): `[p]dayz team add <steam-id> [name]`
+- Remove a player (admin): `[p]dayz team remove <steam-id>`
+- View the roster: `[p]dayz team list`
+- Combined group and individual statistics: `[p]dayz teamstats main`
+
+Aftermath's public API exposes aggregate group statistics, not a roster of group
+members.
+
 ## Admin Commands
 
 - Remove server:

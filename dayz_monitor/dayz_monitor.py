@@ -7,6 +7,7 @@ import struct
 import time
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import quote
 
 import aiohttp
 import discord
@@ -21,15 +22,17 @@ class DayZMonitor(commands.Cog):
     """Monitor DayZ SA Launcher population and alert when servers become full."""
 
     API_BASE = "https://dayzsalauncher.com/api/v2/launcher/players"
+    AFTERMATH_API_BASE = "https://aftermath-gaming.com/api/v1"
     A2S_INFO_QUERY = b"\xff\xff\xff\xffTSource Engine Query\x00"
     A2S_RULES_QUERY = b"\xff\xff\xff\xffV"
     NON_FULL_RESET_SECONDS = 10 * 60
     RESTART_WATCH_MAX_SECONDS = 30 * 60
+    TEAM_MAX_MEMBERS = 6
 
     def __init__(self, bot: Red):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=9013470171, force_registration=True)
-        self.config.register_guild(servers={}, check_interval=60)
+        self.config.register_guild(servers={}, check_interval=60, team_members=[])
         # Discord presence is bot-wide, so only one configured server can
         # drive it at a time.
         self.config.register_global(presence_server=None)
@@ -81,6 +84,84 @@ class DayZMonitor(commands.Cog):
             if not isinstance(data, dict):
                 raise RuntimeError("Unexpected API response format.")
             return data
+
+    async def _fetch_aftermath_data(self, path: str) -> Dict[str, Any]:
+        session = await self._get_session()
+        url = f"{self.AFTERMATH_API_BASE}/{path.lstrip('/')}"
+        async with session.get(url, timeout=15) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"HTTP {resp.status}: {text[:200]}")
+            data = await resp.json(content_type=None)
+            if not isinstance(data, dict):
+                raise RuntimeError("Unexpected Aftermath API response format.")
+            return data
+
+    async def _fetch_aftermath_group_stats(self, server_id: str, group_name: str) -> Dict[str, Any]:
+        return await self._fetch_aftermath_data(
+            f"group/getStats/{quote(group_name, safe='')}/{quote(server_id, safe='')}"
+        )
+
+    async def _fetch_aftermath_player_stats(self, server_id: str, steam_id: str) -> Dict[str, Any]:
+        return await self._fetch_aftermath_data(
+            f"player/getStats/{quote(steam_id, safe='')}/{quote(server_id, safe='')}"
+        )
+
+    @staticmethod
+    def _format_aftermath_stats(subject: str, data: Dict[str, Any]) -> str:
+        def value(key: str, fallback: str = "?") -> str:
+            raw = data.get(key, fallback)
+            return str(raw) if raw is not None else fallback
+
+        lines = [
+            f"**{subject}**",
+            f"Kills: `{value('total_kills', value('TotalKills'))}` | "
+            f"Deaths: `{value('total_deaths', value('TotalDeaths'))}` | "
+            f"K/D: `{value('kd_ratio', value('KDRatio'))}`",
+            f"Longest kill: `{value('longest_kill', value('LongestKill'))} m`",
+        ]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _normalize_team_members(raw_members: Any) -> list:
+        if not isinstance(raw_members, list):
+            return []
+        members = []
+        seen = set()
+        for raw in raw_members:
+            if not isinstance(raw, dict):
+                continue
+            steam_id = str(raw.get("steam_id", ""))
+            if not re.fullmatch(r"\d{17}", steam_id) or steam_id in seen:
+                continue
+            seen.add(steam_id)
+            name = str(raw.get("name") or steam_id)
+            members.append({"steam_id": steam_id, "name": name[:80]})
+        return members
+
+    @staticmethod
+    def _format_team_stats(results: list) -> str:
+        total_kills = 0
+        total_deaths = 0
+        longest_kill = 0.0
+        lines = ["**Team statistics**"]
+        for member, data in results:
+            kills = int(data.get("total_kills", 0) or 0)
+            deaths = int(data.get("total_deaths", 0) or 0)
+            longest = float(data.get("longest_kill", 0) or 0)
+            total_kills += kills
+            total_deaths += deaths
+            longest_kill = max(longest_kill, longest)
+            kd_ratio = "∞" if deaths == 0 and kills else f"{kills / deaths:.2f}" if deaths else "0.00"
+            lines.append(f"- **{member['name']}**: `{kills}` K / `{deaths}` D | `{kd_ratio}` K/D")
+
+        team_kd = "∞" if total_deaths == 0 and total_kills else f"{total_kills / total_deaths:.2f}" if total_deaths else "0.00"
+        lines.insert(
+            1,
+            f"Total: `{total_kills}` K / `{total_deaths}` D | `{team_kd}` K/D | "
+            f"Longest kill: `{longest_kill:.2f} m`",
+        )
+        return "\n".join(lines)
 
     @staticmethod
     def _parse_address(address: str) -> Tuple[str, int]:
@@ -848,6 +929,154 @@ class DayZMonitor(commands.Cog):
         await ctx.send(
             f"Bot status will now show population and queue for `{servers[key].get('name', key)}`."
         )
+
+    @dayz_group.command(name="aftermath")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def dayz_aftermath(self, ctx: commands.Context, name: str, server_id: str):
+        """Set the Aftermath API server ID for a monitored server.
+
+        Example: [p]dayz aftermath main 1ed9f69d-4ee3-6dac-b18b-ea5e938a80e2
+        """
+        key = name.lower()
+        servers = await self.config.guild(ctx.guild).servers()
+        if key not in servers:
+            await ctx.send(f"No monitored server named `{key}`.")
+            return
+        if not re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", server_id):
+            await ctx.send("Invalid Aftermath server ID. It must be a UUID.")
+            return
+
+        servers[key]["aftermath_server_id"] = server_id.lower()
+        await self.config.guild(ctx.guild).servers.set(servers)
+        await ctx.send(f"Aftermath stats for `{servers[key].get('name', key)}` are now configured.")
+
+    async def _get_aftermath_server_id(self, ctx: commands.Context, name: str) -> Optional[str]:
+        key = name.lower()
+        servers = await self.config.guild(ctx.guild).servers()
+        server = servers.get(key)
+        if not server:
+            await ctx.send(f"No monitored server named `{key}`.")
+            return None
+        server_id = server.get("aftermath_server_id")
+        if not server_id:
+            await ctx.send(
+                f"No Aftermath API server ID is configured for `{server.get('name', key)}`. "
+                f"An admin can set it with `{ctx.clean_prefix}dayz aftermath {key} <server-id>`.")
+            return None
+        return str(server_id)
+
+    @dayz_group.group(name="team")
+    async def dayz_team(self, ctx: commands.Context):
+        """Manage this Discord server's Aftermath team roster."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help()
+
+    @dayz_team.command(name="add")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def dayz_team_add(self, ctx: commands.Context, steam_id: str, *, name: Optional[str] = None):
+        """Add a player to the team roster (maximum six)."""
+        if not re.fullmatch(r"\d{17}", steam_id):
+            await ctx.send("Steam ID must be a 17-digit SteamID64.")
+            return
+        team = self._normalize_team_members(await self.config.guild(ctx.guild).team_members())
+        if any(member["steam_id"] == steam_id for member in team):
+            await ctx.send(f"`{steam_id}` is already on the team roster.")
+            return
+        if len(team) >= self.TEAM_MAX_MEMBERS:
+            await ctx.send(f"The team roster is limited to `{self.TEAM_MAX_MEMBERS}` players.")
+            return
+        team.append({"steam_id": steam_id, "name": (name or steam_id).strip()[:80] or steam_id})
+        await self.config.guild(ctx.guild).team_members.set(team)
+        await ctx.send(f"Added `{team[-1]['name']}` to the team roster (`{len(team)}/{self.TEAM_MAX_MEMBERS}`).")
+
+    @dayz_team.command(name="remove", aliases=["del", "delete"])
+    @commands.admin_or_permissions(manage_guild=True)
+    async def dayz_team_remove(self, ctx: commands.Context, steam_id: str):
+        """Remove a Steam ID from the team roster."""
+        team = self._normalize_team_members(await self.config.guild(ctx.guild).team_members())
+        updated = [member for member in team if member["steam_id"] != steam_id]
+        if len(updated) == len(team):
+            await ctx.send(f"`{steam_id}` is not on the team roster.")
+            return
+        await self.config.guild(ctx.guild).team_members.set(updated)
+        await ctx.send(f"Removed `{steam_id}` from the team roster.")
+
+    @dayz_team.command(name="list")
+    async def dayz_team_list(self, ctx: commands.Context):
+        """List the team roster."""
+        team = self._normalize_team_members(await self.config.guild(ctx.guild).team_members())
+        if not team:
+            await ctx.send("The team roster is empty.")
+            return
+        lines = [f"- `{member['name']}` — `{member['steam_id']}`" for member in team]
+        await ctx.send(box("\n".join(lines), lang="md"))
+
+    @dayz_group.command(name="teamstats")
+    async def dayz_team_stats(self, ctx: commands.Context, server: str):
+        """Show aggregate and individual public Aftermath statistics for the team."""
+        team = self._normalize_team_members(await self.config.guild(ctx.guild).team_members())
+        if not team:
+            await ctx.send(
+                f"The team roster is empty. An admin can add players with "
+                f"`{ctx.clean_prefix}dayz team add <steam-id> [name]`."
+            )
+            return
+        server_id = await self._get_aftermath_server_id(ctx, server)
+        if server_id is None:
+            return
+        fetched = await asyncio.gather(
+            *(self._fetch_aftermath_player_stats(server_id, member["steam_id"]) for member in team),
+            return_exceptions=True,
+        )
+        results = []
+        failures = []
+        for member, response in zip(team, fetched):
+            if isinstance(response, Exception):
+                failures.append(member["name"])
+            else:
+                results.append((member, response))
+        if results:
+            await ctx.send(self._format_team_stats(results))
+        if failures:
+            await ctx.send("Could not fetch stats for: " + ", ".join(f"`{name}`" for name in failures))
+
+    @dayz_group.command(name="group")
+    async def dayz_group_stats(self, ctx: commands.Context, server: str, *, group_name: str):
+        """Show public Aftermath stats for a group on a monitored server.
+
+        Example: [p]dayz group main Old Guys Gaming
+        """
+        server_id = await self._get_aftermath_server_id(ctx, server)
+        if server_id is None:
+            return
+        try:
+            stats = await self._fetch_aftermath_group_stats(server_id, group_name)
+        except Exception as exc:
+            await ctx.send(f"Could not fetch Aftermath group stats: `{exc}`")
+            return
+        if not stats.get("clan_name"):
+            await ctx.send(f"No group stats found for `{group_name}`.")
+            return
+        await ctx.send(self._format_aftermath_stats(stats["clan_name"], stats))
+
+    @dayz_group.command(name="player", aliases=["stats"])
+    async def dayz_player_stats(self, ctx: commands.Context, server: str, steam_id: str):
+        """Show public Aftermath stats for a Steam ID on a monitored server.
+
+        Example: [p]dayz player main 76561198080332488
+        """
+        if not re.fullmatch(r"\d{17}", steam_id):
+            await ctx.send("Steam ID must be a 17-digit SteamID64.")
+            return
+        server_id = await self._get_aftermath_server_id(ctx, server)
+        if server_id is None:
+            return
+        try:
+            stats = await self._fetch_aftermath_player_stats(server_id, steam_id)
+        except Exception as exc:
+            await ctx.send(f"Could not fetch Aftermath player stats: `{exc}`")
+            return
+        await ctx.send(self._format_aftermath_stats(f"Steam ID {steam_id}", stats))
 
     @dayz_group.command(name="restart")
     @commands.admin_or_permissions(manage_guild=True)
